@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""
+heapmap: rank allocation hotspots from a Chrome .heaptimeline.
+> DevTools > Memory > Allocations on Timeline > Allocation Stack Traces > Start
+Click around your application (in parts you suspect are leaky or slow). 
+
+Usage:
+    heapmap <profile.heaptimeline> [--maps DIR] [--top N] [--min-kb N] [--script SUBSTR]
+
+    --maps      directory of .js.map files; filenames matched by the last path
+                segment of the script URL (e.g. react-lib-abc123.js -> .js.map)
+    --top       how many rows to print (default 40)
+    --min-kb    skip entries below this size threshold in KB (default 0)
+    --script    filter to entries whose script URL contains SUBSTR
+"""
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+# Parse trace_function_infos flat array -> list of dicts
+def parse_tfi(data):
+    fields = data['snapshot']['meta']['trace_function_info_fields']
+    n = len(fields)
+    raw = data['trace_function_infos']
+    strings = data['strings']
+    infos = []
+    for i in range(len(raw) // n):
+        rec = dict(zip(fields, raw[i * n:(i + 1) * n]))
+        rec['name'] = strings[rec['name']]
+        rec['script_name'] = strings[rec['script_name']]
+        infos.append(rec)
+    return infos
+
+# Walk trace_tree flat encoding and accumulate count+size per fi_index
+# The flat encoding: [id, fi_index, count, size, [children_flat...], ...]
+def accumulate(flat, by_fi):
+    pos = 0
+    while pos < len(flat):
+        fi = flat[pos + 1]
+        by_fi[fi][0] += flat[pos + 2]  # count
+        by_fi[fi][1] += flat[pos + 3]  # size
+        accumulate(flat[pos + 4], by_fi)
+        pos += 5
+
+# Source map resolution (optional)
+# Requires: pip install sourcemap
+def build_map_index(maps_dir):
+    index = {}
+    for p in Path(maps_dir).glob('**/*.map'):
+        index[p.stem] = p  # e.g. "foo.js" -> Path(...)
+    return index
+
+def resolve(script_name, line, col, map_index):
+    if not map_index:
+        return None
+    seg = script_name.rstrip('/').split('/')[-1]
+    map_path = map_index.get(seg)
+    if not map_path:
+        return None
+    try:
+        import sourcemap as sm
+    except ImportError:
+        print('warning: pip install sourcemap for source map resolution', file=sys.stderr)
+        return None
+    try:
+        with open(map_path) as f:
+            smap = sm.loads(f.read())
+        token = smap.lookup(line - 1, col)
+        return f"{token.src}:{token.src_line + 1}:{token.src_col + 1} ({token.name or '?'})"
+    except Exception as e:
+        print(f'warning: resolve failed for {seg}:{line}:{col}: {e}', file=sys.stderr)
+        return None
+
+# Formatting helpers
+def shorten_url(url, keep=2):
+    if not url:
+        return '(native)'
+    parts = url.rstrip('/').split('/')
+    return '/'.join(parts[-keep:]) if len(parts) > keep else url
+
+def fmt_size(b):
+    if b >= 1 << 20:
+        return f"{b / (1 << 20):.2f} MB"
+    if b >= 1 << 10:
+        return f"{b / (1 << 10):.1f} KB"
+    return f"{b} B"
+
+def main():
+    ap = argparse.ArgumentParser(description='Rank allocation hotspots from .heaptimeline')
+    ap.add_argument('profile')
+    ap.add_argument('--maps', default=None, metavar='DIR')
+    ap.add_argument('--top', type=int, default=40)
+    ap.add_argument('--min-kb', type=float, default=0)
+    ap.add_argument('--script', default=None, metavar='SUBSTR')
+    args = ap.parse_args()
+
+    sys.setrecursionlimit(10000)
+
+    print(f'loading {args.profile} ...', file=sys.stderr, flush=True)
+    with open(args.profile) as f:
+        data = json.load(f)
+
+    infos = parse_tfi(data)
+    print(f'{len(infos)} function infos, walking tree ...', file=sys.stderr, flush=True)
+
+    by_fi = defaultdict(lambda: [0, 0])  # fi_index -> [count, size]
+    accumulate(data['trace_tree'], by_fi)
+
+    map_index = build_map_index(args.maps) if args.maps else {}
+    min_bytes = int(args.min_kb * 1024)
+
+    rows = []
+    for fi_idx, (count, size) in by_fi.items():
+        if size < min_bytes:
+            continue
+        if fi_idx >= len(infos):
+            continue
+        info = infos[fi_idx]
+        script = info['script_name']
+        if args.script and args.script not in script:
+            continue
+        resolved = resolve(script, info['line'], info['column'], map_index)
+        rows.append((size, count, info['name'], script, info['line'], info['column'], resolved))
+
+    rows.sort(reverse=True)
+
+    total = sum(r[0] for r in rows)
+    print(f'\ntotal tracked: {fmt_size(total)}  |  showing top {min(args.top, len(rows))} of {len(rows)} sites\n', file=sys.stderr)
+
+    hdr = f"{'SIZE':>10}  {'COUNT':>8}  {'FUNCTION':<24}  LOCATION"
+    print(hdr)
+    print('-' * 100)
+    for size, count, name, script, line, col, resolved in rows[:args.top]:
+        fn = (name or '(anon)')[:24].ljust(24)
+        loc = resolved or f"{shorten_url(script)}:{line}:{col}"
+        print(f"{fmt_size(size):>10}  {count:>8}  {fn}  {loc}")
+
+if __name__ == '__main__':
+    main()
