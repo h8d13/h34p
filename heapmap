@@ -6,12 +6,18 @@ Click around your application (in parts you suspect are leaky or slow).
 
 Usage:
     heapmap <profile.heaptimeline> [--maps DIR] [--top N] [--min-kb N] [--script SUBSTR]
+            [--caller SUBSTR] [--live]
 
     --maps      directory of .js.map files; filenames matched by the last path
                 segment of the script URL (e.g. react-lib-abc123.js -> .js.map)
     --top       how many rows to print (default 40)
     --min-kb    skip entries below this size threshold in KB (default 0)
     --script    filter to entries whose script URL contains SUBSTR
+    --caller    charge each allocation to its nearest stack frame whose script
+                URL contains SUBSTR (e.g. /src/) instead of the allocating
+                function; turns "react jsx" rows into the component behind them
+    --live      count only objects still alive when recording stopped (leaks /
+                retention) instead of everything allocated (churn / GC pressure)
 """
 import argparse
 import json
@@ -35,14 +41,39 @@ def parse_tfi(data):
 
 # Walk trace_tree flat encoding and accumulate count+size per fi_index
 # The flat encoding: [id, fi_index, count, size, [children_flat...], ...]
-def accumulate(flat, by_fi):
-    pos = 0
-    while pos < len(flat):
-        fi = flat[pos + 1]
-        by_fi[fi][0] += flat[pos + 2]  # count
-        by_fi[fi][1] += flat[pos + 3]  # size
-        accumulate(flat[pos + 4], by_fi)
-        pos += 5
+# is_caller(fi) set: charge to the nearest matching ancestor (-1 when none).
+# Returns trace node id -> charged fi_index, used by --live.
+def accumulate(flat, by_fi, is_caller=None):
+    owner_of = {}
+    stack = [(flat, -1)]
+    while stack:
+        flat, owner = stack.pop()
+        for pos in range(0, len(flat), 5):
+            fi = flat[pos + 1]
+            o = fi if is_caller is None or is_caller(fi) else owner
+            owner_of[flat[pos]] = o
+            by_fi[o][0] += flat[pos + 2]  # count
+            by_fi[o][1] += flat[pos + 3]  # size
+            stack.append((flat[pos + 4], o))
+    return owner_of
+
+# Objects in the final snapshot carry the trace node that allocated them.
+def accumulate_live(data, owner_of):
+    meta = data['snapshot']['meta']
+    fields = meta['node_fields']
+    n = len(fields)
+    t_idx = fields.index('trace_node_id')
+    s_idx = fields.index('self_size')
+    nodes = data['nodes']
+    live = defaultdict(lambda: [0, 0])
+    for i in range(0, len(nodes), n):
+        tid = nodes[i + t_idx]
+        if not tid:
+            continue
+        o = owner_of.get(tid, -1)
+        live[o][0] += 1
+        live[o][1] += nodes[i + s_idx]
+    return live
 
 # Source map resolution (optional)
 # Requires: pip install sourcemap
@@ -107,9 +138,9 @@ def main():
     ap.add_argument('--top', type=int, default=40)
     ap.add_argument('--min-kb', type=float, default=0)
     ap.add_argument('--script', default=None, metavar='SUBSTR')
+    ap.add_argument('--caller', default=None, metavar='SUBSTR')
+    ap.add_argument('--live', action='store_true')
     args = ap.parse_args()
-
-    sys.setrecursionlimit(10000)
 
     print(f'loading {args.profile} ...', file=sys.stderr, flush=True)
     with open(args.profile) as f:
@@ -118,8 +149,13 @@ def main():
     infos = parse_tfi(data)
     print(f'{len(infos)} function infos, walking tree ...', file=sys.stderr, flush=True)
 
+    is_caller = None
+    if args.caller:
+        is_caller = lambda fi: args.caller in infos[fi]['script_name']
     by_fi = defaultdict(lambda: [0, 0])  # fi_index -> [count, size]
-    accumulate(data['trace_tree'], by_fi)
+    owner_of = accumulate(data['trace_tree'], by_fi, is_caller)
+    if args.live:
+        by_fi = accumulate_live(data, owner_of)
 
     map_index = build_map_index(args.maps) if args.maps else {}
     min_bytes = int(args.min_kb * 1024)
@@ -127,6 +163,9 @@ def main():
     rows = []
     for fi_idx, (count, size) in by_fi.items():
         if size < min_bytes:
+            continue
+        if fi_idx == -1:
+            rows.append((size, count, f'(no {args.caller} frame)', '', 0, 0, '-'))
             continue
         if fi_idx >= len(infos):
             continue
@@ -140,7 +179,8 @@ def main():
     rows.sort(reverse=True)
 
     total = sum(r[0] for r in rows)
-    print(f'\ntotal tracked: {fmt_size(total)}  |  showing top {min(args.top, len(rows))} of {len(rows)} sites\n', file=sys.stderr)
+    what = 'live at stop' if args.live else 'allocated'
+    print(f'\ntotal {what}: {fmt_size(total)}  |  showing top {min(args.top, len(rows))} of {len(rows)} sites\n', file=sys.stderr)
 
     hdr = f"{'SIZE':>10}  {'COUNT':>8}  {'FUNCTION':<24}  LOCATION"
     print(hdr)
